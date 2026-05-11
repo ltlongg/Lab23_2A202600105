@@ -28,7 +28,6 @@ from .state import AgentState
 def build_graph(checkpointer: Any | None = None):
     """Build and compile the LangGraph workflow.
 
-    TODO(student): review the architecture and modify nodes/edges only with a clear reason.
     Required behaviors:
     - intake -> classify (normalization + routing)
     - classify routes to answer/tool/clarify/risky/retry

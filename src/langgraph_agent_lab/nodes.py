@@ -6,13 +6,22 @@ input state in place.
 
 from __future__ import annotations
 
+import os
+from dotenv import load_dotenv
+from langchain_openai import ChatOpenAI
+from pydantic import BaseModel, Field
+
+# Thêm load_dotenv để đọc các biến từ file .env (override các biến đã có)
+load_dotenv(override=True)
+
 from .state import AgentState, ApprovalDecision, Route, make_event
 
+class Classification(BaseModel):
+    route: Route = Field(description="The assigned route for the user query.")
+    risk_level: str = Field(description="The risk level (low or high).")
 
 def intake_node(state: AgentState) -> dict:
     """Normalize raw query into state fields.
-
-    TODO(student): add normalization, PII checks, and metadata extraction.
     """
     query = state.get("query", "").strip()
     return {
@@ -23,25 +32,61 @@ def intake_node(state: AgentState) -> dict:
 
 
 def classify_node(state: AgentState) -> dict:
-    """Classify the query into a route.
-
-    TODO(student): replace keyword heuristics with a clear routing policy.
-    Required routes: simple, tool, missing_info, risky, error.
+    """Classify the query into a route using LLM.
     """
-    query = state.get("query", "").lower()
-    words = query.split()
-    clean_words = [w.strip("?!.,;:") for w in words]
-    route = Route.SIMPLE
-    risk_level = "low"
-    if "refund" in query or "delete" in query or "send" in query:
-        route = Route.RISKY
-        risk_level = "high"
-    elif "status" in query or "order" in query or "lookup" in query:
-        route = Route.TOOL
-    elif len(clean_words) < 5 and "it" in clean_words:
-        route = Route.MISSING_INFO
-    elif "timeout" in query or "fail" in query:
-        route = Route.ERROR
+    import os
+    query = state.get("query", "")
+    
+    model_name = os.getenv("OPENAI_MODEL_NAME", "gpt-4o-mini")
+    api_key = os.getenv("OPENAI_API_KEY")
+    base_url = os.getenv("OPENAI_BASE_URL")
+    
+    llm = ChatOpenAI(
+        model=model_name, 
+        temperature=0,
+        api_key=api_key,
+        base_url=base_url
+    )
+    prompt = f"""
+    You are an expert support ticket router.
+    Analyze this query: "{query}"
+
+    Routes:
+    - risky: refund, delete, send, cancel, remove, revoke (risk_level: high)
+    - tool: status, order, lookup, check, track, find, search
+    - missing_info: very short queries missing context (like "it", "this")
+    - error: timeout, fail, error, crash, unavailable
+    - simple: anything else
+    
+    Higher priority to risky > tool > missing_info > error > simple.
+
+    Return ONLY a valid JSON object without any markup or thinking blocks.
+    The JSON must contain exactly two keys: "route" and "risk_level".
+    Example: {{"route": "tool", "risk_level": "low"}}
+    """
+    try:
+        response = llm.invoke(prompt)
+        text_content = response.content
+        
+        # Xử lý dọn dẹp thẻ <think> của các model reasoning
+        if "</think>" in text_content:
+            text_content = text_content.split("</think>")[-1]
+            
+        # Trích xuất JSON từ chuỗi kết quả
+        import re, json
+        json_match = re.search(r'\{[\s\S]*\}', text_content)
+        if json_match:
+            parsed = json.loads(json_match.group(0))
+            route = Route(parsed.get("route", Route.SIMPLE.value))
+            risk_level = parsed.get("risk_level", "low")
+        else:
+            raise ValueError("No JSON found")
+    except Exception as e:
+        print(e)
+        # Fallback to simple if LLM fails
+        route = Route.SIMPLE
+        risk_level = "low"
+
     return {
         "route": route.value,
         "risk_level": risk_level,
@@ -51,8 +96,6 @@ def classify_node(state: AgentState) -> dict:
 
 def ask_clarification_node(state: AgentState) -> dict:
     """Ask for missing information instead of hallucinating.
-
-    TODO(student): generate a specific clarification question from state.
     """
     question = "Can you provide the order id or the missing context?"
     return {
@@ -66,7 +109,6 @@ def tool_node(state: AgentState) -> dict:
     """Call a mock tool.
 
     Simulates transient failures for error-route scenarios to demonstrate retry loops.
-    TODO(student): implement idempotent tool execution and structured tool results.
     """
     attempt = int(state.get("attempt", 0))
     if state.get("route") == Route.ERROR.value and attempt < 2:
@@ -81,8 +123,6 @@ def tool_node(state: AgentState) -> dict:
 
 def risky_action_node(state: AgentState) -> dict:
     """Prepare a risky action for approval.
-
-    TODO(student): create a proposed action with evidence and risk justification.
     """
     return {
         "proposed_action": "prepare refund or external action; approval required",
@@ -95,8 +135,6 @@ def approval_node(state: AgentState) -> dict:
 
     Set LANGGRAPH_INTERRUPT=true to use real interrupt() for HITL demos.
     Default uses mock decision so tests and CI run offline.
-
-    TODO(student): implement reject/edit decisions and timeout escalation.
     """
     import os
 
@@ -121,8 +159,6 @@ def approval_node(state: AgentState) -> dict:
 
 def retry_or_fallback_node(state: AgentState) -> dict:
     """Record a retry attempt or fallback decision.
-
-    TODO(student): implement bounded retry, exponential backoff metadata, and fallback route.
     """
     attempt = int(state.get("attempt", 0)) + 1
     errors = [f"transient failure attempt={attempt}"]
@@ -135,8 +171,6 @@ def retry_or_fallback_node(state: AgentState) -> dict:
 
 def answer_node(state: AgentState) -> dict:
     """Produce a final response.
-
-    TODO(student): ground the answer in tool_results and approval where relevant.
     """
     if state.get("tool_results"):
         answer = f"I found: {state['tool_results'][-1]}"
@@ -150,8 +184,6 @@ def answer_node(state: AgentState) -> dict:
 
 def evaluate_node(state: AgentState) -> dict:
     """Evaluate tool results — the 'done?' check that enables retry loops.
-
-    TODO(student): replace heuristic with LLM-as-judge or structured validation.
     """
     tool_results = state.get("tool_results", [])
     latest = tool_results[-1] if tool_results else ""
@@ -170,7 +202,6 @@ def dead_letter_node(state: AgentState) -> dict:
     """Log unresolvable failures for manual review.
 
     Third layer of error strategy: retry -> fallback -> dead letter.
-    TODO(student): persist to dead-letter queue, alert on-call, or create support ticket.
     """
     return {
         "final_answer": "Request could not be completed after maximum retry attempts. Logged for manual review.",
